@@ -29,10 +29,14 @@ func TestLibp2pKeygen(t *testing.T) {
 	for i, pid := range parties {
 		h, err := network.NewHost(ctx, pid, "/ip4/127.0.0.1/tcp/0")
 		require.NoError(t, err)
-		defer h.Close()
 		hosts[i] = h
 		t.Logf("host %s: peer=%s addrs=%v", pid, h.PeerID(), h.Addrs())
 	}
+	defer func() {
+		for _, h := range hosts {
+			h.Close()
+		}
+	}()
 
 	// 2. Connect hosts directly (for a reliable local test instead of mDNS race).
 	for i := 0; i < len(hosts); i++ {
@@ -51,9 +55,13 @@ func TestLibp2pKeygen(t *testing.T) {
 	for i, h := range hosts {
 		sn, err := network.NewSessionNetwork(ctx, h, sessionID)
 		require.NoError(t, err)
-		defer sn.Close()
 		sessions[i] = sn
 	}
+	defer func() {
+		for _, s := range sessions {
+			s.Close()
+		}
+	}()
 
 	// Give subscriptions time to propagate.
 	time.Sleep(time.Second)
