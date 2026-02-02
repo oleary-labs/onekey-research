@@ -1,0 +1,169 @@
+package network
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"sync"
+
+	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/luxfi/threshold/pkg/party"
+	thresholdProtocol "github.com/luxfi/threshold/pkg/protocol"
+)
+
+const (
+	ProtocolID = protocol.ID("/threshold/1.0.0")
+	// maxMessageSize is the maximum size of a length-prefixed message (10MB).
+	maxMessageSize = 10 * 1024 * 1024
+)
+
+// Host wraps a libp2p host and maintains party.ID <-> peer.ID mappings.
+type Host struct {
+	h      host.Host
+	pubsub *pubsub.PubSub
+	self   party.ID
+
+	mu      sync.RWMutex
+	parties map[party.ID]peer.ID // party.ID -> peer.ID
+	peers   map[peer.ID]party.ID // peer.ID -> party.ID
+
+	// incoming is fed by the stream handler; sessions drain it.
+	incoming chan *thresholdProtocol.Message
+}
+
+// NewHost creates a libp2p host listening on the given multiaddr (e.g. "/ip4/127.0.0.1/tcp/0").
+func NewHost(ctx context.Context, self party.ID, listenAddr string) (*Host, error) {
+	h, err := libp2p.New(libp2p.ListenAddrStrings(listenAddr))
+	if err != nil {
+		return nil, fmt.Errorf("libp2p new: %w", err)
+	}
+
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		h.Close()
+		return nil, fmt.Errorf("gossipsub: %w", err)
+	}
+
+	host := &Host{
+		h:        h,
+		pubsub:   ps,
+		self:     self,
+		parties:  make(map[party.ID]peer.ID),
+		peers:    make(map[peer.ID]party.ID),
+		incoming: make(chan *thresholdProtocol.Message, 1000),
+	}
+
+	// Register stream handler for directed messages.
+	h.SetStreamHandler(ProtocolID, host.handleStream)
+
+	return host, nil
+}
+
+// Self returns the party.ID of this host.
+func (h *Host) Self() party.ID { return h.self }
+
+// PeerID returns the libp2p peer.ID of this host.
+func (h *Host) PeerID() peer.ID { return h.h.ID() }
+
+// Addrs returns the listen addresses as strings.
+func (h *Host) Addrs() []string {
+	addrs := h.h.Addrs()
+	out := make([]string, len(addrs))
+	for i, a := range addrs {
+		out[i] = a.String()
+	}
+	return out
+}
+
+// RegisterPeer adds a party.ID <-> peer.ID mapping.
+func (h *Host) RegisterPeer(partyID party.ID, peerID peer.ID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.parties[partyID] = peerID
+	h.peers[peerID] = partyID
+}
+
+// PeerForParty returns the peer.ID for a given party.ID.
+func (h *Host) PeerForParty(id party.ID) (peer.ID, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	pid, ok := h.parties[id]
+	return pid, ok
+}
+
+// LibP2PHost returns the underlying libp2p host (for connect/discovery).
+func (h *Host) LibP2PHost() host.Host { return h.h }
+
+// PubSub returns the GossipSub instance.
+func (h *Host) PubSub() *pubsub.PubSub { return h.pubsub }
+
+// Incoming returns the channel of directed messages received via streams.
+func (h *Host) Incoming() <-chan *thresholdProtocol.Message { return h.incoming }
+
+// Close shuts down the host.
+func (h *Host) Close() error { return h.h.Close() }
+
+// handleStream is called for every inbound stream on /threshold/1.0.0.
+func (h *Host) handleStream(s network.Stream) {
+	defer s.Close()
+	msg, err := readMessage(s)
+	if err != nil {
+		return
+	}
+	h.incoming <- msg
+}
+
+// SendDirect opens a stream to the target peer and writes a length-prefixed message.
+func (h *Host) SendDirect(ctx context.Context, target peer.ID, msg *thresholdProtocol.Message) error {
+	s, err := h.h.NewStream(ctx, target, ProtocolID)
+	if err != nil {
+		return fmt.Errorf("new stream to %s: %w", target, err)
+	}
+	defer s.Close()
+	return writeMessage(s, msg)
+}
+
+// writeMessage writes a length-prefixed (4-byte big-endian) CBOR payload.
+func writeMessage(w io.Writer, msg *thresholdProtocol.Message) error {
+	data, err := msg.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	if len(data) > maxMessageSize {
+		return fmt.Errorf("message too large: %d > %d", len(data), maxMessageSize)
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
+	if _, err := w.Write(lenBuf[:]); err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
+}
+
+// readMessage reads a length-prefixed CBOR message.
+func readMessage(r io.Reader) (*thresholdProtocol.Message, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(lenBuf[:])
+	if n > maxMessageSize {
+		return nil, fmt.Errorf("message too large: %d > %d", n, maxMessageSize)
+	}
+	data := make([]byte, n)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+	msg := &thresholdProtocol.Message{}
+	if err := msg.UnmarshalBinary(data); err != nil {
+		return nil, fmt.Errorf("unmarshal: %w", err)
+	}
+	return msg, nil
+}
